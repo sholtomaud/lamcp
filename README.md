@@ -136,8 +136,10 @@ exec()s code inside your live Rhino session.
 | `add_param_marker`          | drop a named floating parameter as a labeled pass-through bus            |
 | `describe_canvas_structure` | inspect objects, groups, params, and source connections on the canvas    |
 | `upgrade_components`        | replace userobject-based components with the latest installed version    |
+| `search_components`         | find installed components by name; returns type GUID + parameter order   |
+| `inspect_component_data`    | read the data on a component's outputs (counts, tree paths, samples)     |
 | `capture_grasshopper_canvas`| screenshot the canvas (zoom-to-fit, view restored) as an inline PNG       |
-| `capture_rhino_viewport`    | screenshot the active Rhino viewport as an inline PNG                     |
+| `capture_rhino_viewport`    | screenshot the active Rhino viewport, optionally reframed, as inline PNG  |
 
 ### Return contract for `run_python_script`
 

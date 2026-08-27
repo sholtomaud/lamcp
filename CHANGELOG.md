@@ -7,6 +7,45 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## Unreleased
 
+## [0.8.0] - 2026-08-27
+
+### Added
+
+* New `search_components` tool: find installed Grasshopper components by name
+  and get back their registered type GUID (for `ComponentServer.EmitObject`)
+  plus their inputs and outputs *in parameter order*, including each input's
+  access (item/list/tree). This is the lookup step before building a definition
+  programmatically, where wiring is positional and picking an obsolete proxy
+  registered under the same display name silently gives you the wrong
+  parameters. Obsolete proxies are hidden by default.
+* New `inspect_component_data` tool: read the volatile data on a component's
+  outputs (and optionally its inputs) — data count, tree paths, and a sample of
+  values, alongside any runtime messages. Checks that a definition is *correct*,
+  not merely error-free: Grasshopper's longest-list matching happily produces
+  `max(m, n)` results where a cross-reference was intended, and reports no
+  error while doing it.
+* `capture_rhino_viewport` gained `view` and `zoom_extents` parameters to set a
+  standard projection (`perspective`, `top`, `front`, ...) and frame the
+  geometry before capturing, replacing a hand-written `run_python_script`
+  camera dance. Elevations are usually the most diagnostic view for checking a
+  structure's geometry.
+
+### Fixed
+
+* Both capture tools raised `BufferError: SIMPLE not implemented` and could
+  never return an image. `MemoryStream.ToArray()` returns a `System.Byte[]`,
+  and Rhino 8's CPython interop does not expose a *simple* buffer for .NET
+  arrays — which is exactly what `binascii.b2a_base64` asks for, so
+  `base64.b64encode(ms.ToArray())` always threw. The PNG is now encoded with
+  `System.Convert.ToBase64String` on the .NET side, which sidesteps the buffer
+  protocol (and one full marshal copy).
+* `capture_grasshopper_canvas` no longer captures blank canvas when
+  `zoom_extents` is set. It framed the graph by assigning `GH_Viewport.Target`,
+  which is a screen-space property and does not recentre the view; the
+  document-space centre is `MidPoint`, and the projection transform has to be
+  rebuilt with `ComputeProjection()` afterwards. The saved/restored view state
+  moved to `MidPoint` to match.
+
 ## [0.7.1] - 2026-06-12
 
 ### Fixed

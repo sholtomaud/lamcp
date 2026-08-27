@@ -1254,6 +1254,278 @@ def upgrade_components(
 
 
 # ---------------------------------------------------------------------------
+# Discovery and data inspection
+# ---------------------------------------------------------------------------
+# Building a definition programmatically needs two things the canvas listing
+# can't give you: the *registered type GUID* of a component you haven't placed
+# yet (to feed ``ComponentServer.EmitObject``) together with its parameter
+# order, and — once wired — the actual data flowing out of a component, so you
+# can tell a correct graph from one that merely solves without errors.
+
+_SEARCH_COMPONENTS_SCRIPT = """
+import Grasshopper
+
+QUERY = __QUERY__
+LIMIT = __LIMIT__
+INCLUDE_OBSOLETE = __OBSOLETE__
+
+def _rank(name, nickname, query):
+    name = (name or "").lower()
+    nickname = (nickname or "").lower()
+    if name == query or nickname == query:
+        return 0
+    if name.startswith(query):
+        return 1
+    if query in name:
+        return 2
+    return 3
+
+def _params(obj):
+    inputs, outputs = [], []
+    for p in obj.Params.Input:
+        inputs.append({
+            "name": p.Name,
+            "nickname": p.NickName,
+            "access": str(p.Access),
+            "type": p.TypeName,
+            "optional": bool(p.Optional),
+        })
+    for p in obj.Params.Output:
+        outputs.append({"name": p.Name, "nickname": p.NickName, "type": p.TypeName})
+    return inputs, outputs
+
+def _search():
+    query = QUERY.strip().lower()
+    if not query:
+        raise Exception("Empty query.")
+    server = Grasshopper.Instances.ComponentServer
+    matches = []
+    for proxy in server.ObjectProxies:
+        if proxy.Obsolete and not INCLUDE_OBSOLETE:
+            continue
+        desc = proxy.Desc
+        haystack = " ".join([
+            desc.Name or "", desc.NickName or "",
+            desc.Category or "", desc.SubCategory or "",
+        ]).lower()
+        if query not in haystack:
+            continue
+        matches.append(proxy)
+    matches.sort(key=lambda p: (_rank(p.Desc.Name, p.Desc.NickName, query), p.Desc.Name or ""))
+
+    components = []
+    for proxy in matches[:LIMIT]:
+        desc = proxy.Desc
+        entry = {
+            "name": desc.Name,
+            "nickname": desc.NickName,
+            "category": desc.Category,
+            "subcategory": desc.SubCategory,
+            "guid": str(proxy.Guid),
+            "obsolete": bool(proxy.Obsolete),
+        }
+        # Instantiating is how we learn the parameter order; the instance is
+        # never added to a document, so this leaves the canvas untouched.
+        try:
+            obj = proxy.CreateInstance()
+            if hasattr(obj, "Params"):
+                entry["inputs"], entry["outputs"] = _params(obj)
+            else:
+                entry["inputs"], entry["outputs"] = [], []
+                entry["note"] = "parameter or special object (no Params collection)"
+        except Exception as exc:
+            entry["error"] = "could not instantiate: %s" % exc
+        components.append(entry)
+
+    return {
+        "query": QUERY,
+        "match_count": len(matches),
+        "returned": len(components),
+        "components": components,
+    }
+
+_ = _lamcp_run_on_ui(_search)
+"""
+
+
+@mcp.tool()
+def search_components(
+    query: str, limit: int = 12, include_obsolete: bool = False
+) -> dict:
+    """Find installed Grasshopper components by name, and report their parameters.
+
+    This is the lookup step before building a definition programmatically:
+    ``ComponentServer.EmitObject(System.Guid(guid))`` needs the registered type
+    GUID returned here, and wiring needs the exact input/output *order*, since
+    ``Params.Input[i].AddSource(other.Params.Output[j])`` is positional.
+
+    Matching is a case-insensitive substring test over name, nickname, category
+    and subcategory, ranked exact-match first. Obsolete proxies are hidden by
+    default — Grasshopper keeps superseded versions registered under the same
+    display name, and picking one of those is a common way to end up with a
+    component whose parameters don't match current documentation.
+
+    The ``access`` field on an input matters for data matching: an ``item``
+    input fed a list triggers per-item replication, a ``list`` input accepts
+    several sources and concatenates them in connection order.
+
+    Parameters
+    ----------
+    query : str
+        Substring to search for, e.g. ``"divide curve"`` or ``"interpolate"``.
+    limit : int, optional
+        Maximum components to return in full (default 12). ``match_count``
+        always reports how many matched, so a truncated result is visible.
+    include_obsolete : bool, optional
+        Also return superseded component versions (default False).
+
+    Returns
+    -------
+    dict
+        Same envelope as :func:`run_python_script`. ``result`` is the ``repr``
+        of ``{"query", "match_count", "returned", "components": [...]}``, where
+        each component carries ``name``, ``nickname``, ``category``,
+        ``subcategory``, ``guid``, ``obsolete``, and ``inputs`` / ``outputs``
+        lists in parameter order.
+    """
+    code = _UI_THREAD_BOOTSTRAP + _SEARCH_COMPONENTS_SCRIPT.replace(
+        "__QUERY__", repr(str(query))
+    ).replace("__LIMIT__", repr(max(1, int(limit)))).replace(
+        "__OBSOLETE__", repr(bool(include_obsolete))
+    )
+    return run_python_script(code, timeout=DEFAULT_TIMEOUT)
+
+
+_INSPECT_DATA_SCRIPT = """
+import Grasshopper
+
+TARGET = __TARGET__
+MAX_ITEMS = __MAX_ITEMS__
+INCLUDE_INPUTS = __INCLUDE_INPUTS__
+
+def _match(obj, needle):
+    if str(obj.InstanceGuid).lower() == needle:
+        return True
+    nickname = (obj.NickName or "").lower()
+    return nickname == needle or needle in nickname
+
+def _structure(param):
+    data = param.VolatileData
+    paths, sample = [], []
+    for i in range(data.PathCount):
+        branch = data.get_Branch(i)
+        paths.append({"path": str(data.Paths[i]), "count": branch.Count})
+        for item in branch:
+            if len(sample) >= MAX_ITEMS:
+                break
+            sample.append("None" if item is None else str(item))
+    return {
+        "name": param.Name,
+        "nickname": param.NickName,
+        "type": param.TypeName,
+        "data_count": data.DataCount,
+        "path_count": data.PathCount,
+        "paths": paths[:MAX_ITEMS],
+        "sample": sample,
+        "truncated": data.DataCount > len(sample),
+    }
+
+def _messages(obj):
+    levels = Grasshopper.Kernel.GH_RuntimeMessageLevel
+    out = {}
+    for label, level in (("errors", levels.Error), ("warnings", levels.Warning),
+                         ("remarks", levels.Remark)):
+        try:
+            msgs = [str(m) for m in obj.RuntimeMessages(level)]
+        except Exception:
+            msgs = []
+        if msgs:
+            out[label] = msgs
+    return out
+
+def _inspect():
+    canvas = Grasshopper.Instances.ActiveCanvas
+    doc = None if canvas is None else canvas.Document
+    if doc is None:
+        raise Exception("No active Grasshopper document.")
+    needle = TARGET.strip().lower()
+    results = []
+    for obj in doc.Objects:
+        if not _match(obj, needle):
+            continue
+        entry = {
+            "nickname": obj.NickName,
+            "guid": str(obj.InstanceGuid),
+            "type": obj.GetType().Name,
+        }
+        entry.update(_messages(obj))
+        if hasattr(obj, "Params"):
+            entry["outputs"] = [_structure(p) for p in obj.Params.Output]
+            if INCLUDE_INPUTS:
+                entry["inputs"] = [_structure(p) for p in obj.Params.Input]
+        elif hasattr(obj, "VolatileData"):
+            # A floating parameter is its own data holder.
+            entry["outputs"] = [_structure(obj)]
+        else:
+            entry["outputs"] = []
+            entry["note"] = "object holds no volatile data"
+        results.append(entry)
+    if not results:
+        raise Exception(
+            "No object matched %r. Use list_grasshopper_objects to see nicknames."
+            % TARGET
+        )
+    return {"target": TARGET, "count": len(results), "objects": results}
+
+_ = _lamcp_run_on_ui(_inspect)
+"""
+
+
+@mcp.tool()
+def inspect_component_data(
+    target: str, max_items: int = 10, include_inputs: bool = False
+) -> dict:
+    """Read the data currently flowing out of a component on the canvas.
+
+    This is how you check that a definition is actually *correct* rather than
+    merely free of runtime errors. A solved graph reports no errors when
+    Grasshopper's data matching silently does the wrong thing — the classic
+    case being an ``item``-access input fed two lists of different lengths,
+    where longest-list matching yields ``max(m, n)`` results instead of the
+    ``m * n`` cross-reference you expected. Counting the output tells you;
+    the canvas does not.
+
+    Reports, per matched object: the data count and tree structure of every
+    output, a sample of the values, and any runtime messages.
+
+    Parameters
+    ----------
+    target : str
+        Instance GUID, or a nickname (exact match preferred, otherwise
+        substring). Several objects may match, and all are returned.
+    max_items : int, optional
+        Maximum values (and tree paths) sampled per output (default 10).
+        ``data_count`` and ``truncated`` still describe the full data.
+    include_inputs : bool, optional
+        Also report the data arriving on each input (default False). Useful
+        when an output looks wrong and you need to see which side of the
+        component the mismatch came in on.
+
+    Returns
+    -------
+    dict
+        Same envelope as :func:`run_python_script`. ``result`` is the ``repr``
+        of ``{"target", "count", "objects": [...]}``.
+    """
+    code = _UI_THREAD_BOOTSTRAP + _INSPECT_DATA_SCRIPT.replace(
+        "__TARGET__", repr(str(target))
+    ).replace("__MAX_ITEMS__", repr(max(1, int(max_items)))).replace(
+        "__INCLUDE_INPUTS__", repr(bool(include_inputs))
+    )
+    return run_python_script(code, timeout=DEFAULT_TIMEOUT)
+
+
+# ---------------------------------------------------------------------------
 # Screen capture
 # ---------------------------------------------------------------------------
 # Both captures render UI surfaces (the GH canvas control / the Rhino view) and
@@ -1261,10 +1533,23 @@ def upgrade_components(
 # encodes the PNG as base64 and assigns it to ``_``; the bridge returns
 # ``repr(_)``, which the tool un-reprs, decodes, and returns as an inline
 # ``Image`` (optionally also writing it to ``path``).
+#
+# ENCODE WITH ``System.Convert.ToBase64String`` — NOT ``base64.b64encode``.
+# ``MemoryStream.ToArray()`` hands back a ``System.Byte[]``, and Rhino 8's
+# CPython interop does not expose a *simple* (C-contiguous, format-less) buffer
+# for .NET arrays. ``binascii.b2a_base64`` requests exactly that, so
+# ``base64.b64encode(ms.ToArray())`` dies with
+# ``BufferError: SIMPLE not implemented``. Encoding on the .NET side sidesteps
+# the buffer protocol entirely (and avoids a full byte-by-byte marshal copy).
+#
+# FRAME THE CANVAS WITH ``vp.MidPoint`` — NOT ``vp.Target``. On ``GH_Viewport``,
+# ``Target`` is a screen-space property and assigning it does not recentre the
+# view; ``MidPoint`` is the document-space centre. Set ``Zoom`` first, then
+# ``MidPoint``, then call ``ComputeProjection()`` to rebuild the transform.
 
 _CAPTURE_CANVAS_SCRIPT = """
-import Grasshopper, base64
-from System.Drawing import Bitmap, Rectangle, Point
+import Grasshopper, System
+from System.Drawing import Bitmap, Rectangle, PointF
 from System.Drawing.Imaging import ImageFormat
 from System.IO import MemoryStream
 
@@ -1274,34 +1559,46 @@ def _capture():
         raise Exception("No active Grasshopper canvas.")
     doc = canvas.Document
     vp = canvas.Viewport
-    saved_target, saved_zoom = vp.Target, vp.Zoom
+    saved_mid, saved_zoom = vp.MidPoint, vp.Zoom
     try:
         if __ZOOM__ and doc is not None and doc.ObjectCount > 0:
             r = doc.BoundingBox()
             if r.Width > 0 and r.Height > 0:
-                vp.Target = Point(int(r.X + r.Width / 2.0), int(r.Y + r.Height / 2.0))
                 cw, ch = float(canvas.Width), float(canvas.Height)
                 pad = float(__PAD__)
                 z = min((cw - 2.0 * pad) / r.Width, (ch - 2.0 * pad) / r.Height)
                 vp.Zoom = max(0.05, min(z, 1.0))
+                vp.MidPoint = PointF(r.X + r.Width / 2.0, r.Y + r.Height / 2.0)
+                vp.ComputeProjection()
         w, h = int(canvas.Width), int(canvas.Height)
         bmp = Bitmap(w, h)
         canvas.DrawToBitmap(bmp, Rectangle(0, 0, w, h))
     finally:
-        vp.Target = saved_target
         vp.Zoom = saved_zoom
+        vp.MidPoint = saved_mid
+        vp.ComputeProjection()
         canvas.Refresh()
     ms = MemoryStream()
     bmp.Save(ms, ImageFormat.Png)
-    return base64.b64encode(ms.ToArray()).decode("ascii")
+    return System.Convert.ToBase64String(ms.ToArray())
 
 _ = _lamcp_run_on_ui(_capture)
 """
 
 _CAPTURE_VIEWPORT_SCRIPT = """
-import Rhino, System, base64
+import Rhino, System
 from System.Drawing.Imaging import ImageFormat
 from System.IO import MemoryStream
+
+_PROJECTIONS = {
+    "perspective": Rhino.Display.DefinedViewportProjection.Perspective,
+    "top": Rhino.Display.DefinedViewportProjection.Top,
+    "bottom": Rhino.Display.DefinedViewportProjection.Bottom,
+    "front": Rhino.Display.DefinedViewportProjection.Front,
+    "back": Rhino.Display.DefinedViewportProjection.Back,
+    "left": Rhino.Display.DefinedViewportProjection.Left,
+    "right": Rhino.Display.DefinedViewportProjection.Right,
+}
 
 def _capture():
     doc = Rhino.RhinoDoc.ActiveDoc
@@ -1310,12 +1607,25 @@ def _capture():
     view = doc.Views.ActiveView
     if view is None:
         raise Exception("No active Rhino view.")
+    view_name = __VIEW__
+    if view_name is not None:
+        key = str(view_name).strip().lower()
+        if key not in _PROJECTIONS:
+            raise Exception(
+                "Unknown view %r. Expected one of: %s"
+                % (view_name, ", ".join(sorted(_PROJECTIONS)))
+            )
+        view.ActiveViewport.SetProjection(_PROJECTIONS[key], key, False)
+    if __ZOOM__:
+        view.ActiveViewport.ZoomExtents()
+    if view_name is not None or __ZOOM__:
+        view.Redraw()
     bmp = view.CaptureToBitmap(System.Drawing.Size(__W__, __H__))
     if bmp is None:
         raise Exception("CaptureToBitmap returned None.")
     ms = MemoryStream()
     bmp.Save(ms, ImageFormat.Png)
-    return base64.b64encode(ms.ToArray()).decode("ascii")
+    return System.Convert.ToBase64String(ms.ToArray())
 
 _ = _lamcp_run_on_ui(_capture)
 """
@@ -1376,7 +1686,11 @@ def capture_grasshopper_canvas(
 
 @mcp.tool()
 def capture_rhino_viewport(
-    path: str | None = None, width: int = 1600, height: int = 1000
+    path: str | None = None,
+    width: int = 1600,
+    height: int = 1000,
+    view: str | None = None,
+    zoom_extents: bool = False,
 ) -> Image:
     """Capture the active Rhino viewport (the 3D result) as a PNG.
 
@@ -1384,12 +1698,27 @@ def capture_rhino_viewport(
     drawn by a Grasshopper definition — and returns it inline. Runs on Rhino's
     UI thread.
 
+    ``view`` and ``zoom_extents`` reframe the viewport before capturing, which
+    saves a hand-written ``run_python_script`` camera dance when you just want
+    to see the geometry. Unlike :func:`capture_grasshopper_canvas`, the camera
+    is **not** restored afterwards — the reframed view is left as the user's
+    live view, since that is usually what you want when inspecting a result.
+
     Parameters
     ----------
     path : str, optional
         If given, the PNG is also written to this path.
     width, height : int, optional
         Capture resolution in pixels (default 1600x1000).
+    view : str, optional
+        Set a standard projection first: ``"perspective"``, ``"top"``,
+        ``"bottom"``, ``"front"``, ``"back"``, ``"left"`` or ``"right"``.
+        Omit to keep the current camera. Elevations (``"front"``, ``"right"``)
+        are usually the most diagnostic for checking a structure's geometry.
+    zoom_extents : bool, optional
+        Zoom to fit all visible geometry before capturing (default False).
+        Note this frames the construction-plane grid too, so a small model in a
+        large grid can end up tiny.
 
     Returns
     -------
@@ -1398,7 +1727,9 @@ def capture_rhino_viewport(
     """
     code = _UI_THREAD_BOOTSTRAP + _CAPTURE_VIEWPORT_SCRIPT.replace(
         "__W__", repr(int(width))
-    ).replace("__H__", repr(int(height)))
+    ).replace("__H__", repr(int(height))).replace("__VIEW__", repr(view)).replace(
+        "__ZOOM__", repr(bool(zoom_extents))
+    )
     return _decode_capture(run_python_script(code, timeout=30.0), path)
 
 
